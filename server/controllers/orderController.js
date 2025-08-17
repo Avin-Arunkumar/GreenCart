@@ -39,28 +39,41 @@ export const placeOrderStripe = async (req, res) => {
   try {
     const { userId, items, addressId } = req.body;
     const { origin } = req.headers;
-    if (!addressId || items.length === 0) {
-      return res.json({ success: false, message: "Invalid data" });
+
+    // Validate input
+    if (!userId || !addressId || !items || items.length === 0) {
+      return res.status(400).json({ success: false, message: "Invalid data" });
     }
 
-    let amount = await items.reduce(async (acc, item) => {
+    // Calculate total amount
+    let amount = 0;
+    for (const item of items) {
       const product = await Product.findById(item.product);
-      return (await acc) + product.offerPrice * item.quantity;
-    }, 0);
-    // Add Tax Charge(2%)
+      if (!product) {
+        return res.status(404).json({
+          success: false,
+          message: `Product ${item.product} not found`,
+        });
+      }
+      amount += product.offerPrice * item.quantity;
+    }
+    // Add 2% tax
     amount += Math.floor(amount * 0.02);
+
+    // Create order
     const order = await Order.create({
       userId,
       items,
       amount,
       address: addressId,
       paymentType: "online",
+      isPaid: false,
     });
 
-    // Stripe Gateway Initialize
+    // Initialize Stripe
     const stripeInstance = new stripe(process.env.STRIPE_SECRET_KEY);
 
-    // Create line items for stripe, including quantity from items array
+    // Create line items
     const line_items = await Promise.all(
       items.map(async (item) => {
         const product = await Product.findById(item.product);
@@ -69,7 +82,7 @@ export const placeOrderStripe = async (req, res) => {
             currency: "usd",
             product_data: {
               name: product.name,
-              description: product.description[0] || "Product description",
+              description: product.description?.[0] || "Product description",
             },
             unit_amount: Math.floor(product.offerPrice * 100),
           },
@@ -78,11 +91,11 @@ export const placeOrderStripe = async (req, res) => {
       })
     );
 
-    // Create session
+    // Create Stripe session
     const session = await stripeInstance.checkout.sessions.create({
       line_items,
       mode: "payment",
-      success_url: `${origin}/loader?next=my-orders`,
+      success_url: `${origin}/loader?next=my-orders&orderId=${order._id}`,
       cancel_url: `${origin}/cart`,
       metadata: {
         orderId: order._id.toString(),
@@ -96,16 +109,14 @@ export const placeOrderStripe = async (req, res) => {
     });
   } catch (error) {
     console.error("Order creation error:", error);
-    return res.json({ success: false, message: error.message });
+    return res.status(500).json({ success: false, message: error.message });
   }
 };
-// Stripe webhooks to verify payments Action : /stripe
 
 export const stripeWebhooks = async (request, response) => {
-  //Stripe gateway Initialize
   const stripeInstance = new stripe(process.env.STRIPE_SECRET_KEY);
-
   const sig = request.headers["stripe-signature"];
+
   let event;
   try {
     event = stripeInstance.webhooks.constructEvent(
@@ -114,42 +125,81 @@ export const stripeWebhooks = async (request, response) => {
       process.env.STRIPE_WEBHOOK_SECRET
     );
   } catch (error) {
-    response.status(400).send(`Webhook Error:${error.message}`);
+    console.error("Webhook signature verification failed:", error.message);
+    return response.status(400).send(`Webhook Error: ${error.message}`);
   }
-  //Handle the event
+
+  // Handle the event
   switch (event.type) {
-    case "payment_intent.succeeded": {
-      const paymentIntent = event.data.object;
-      const paymentIntentId = paymentIntent.id;
+    case "checkout.session.completed": {
+      const session = event.data.object;
+      const { orderId, userId } = session.metadata;
 
-      // Getting Session Metadata
-      const session = await stripeInstance.checkout.sessions.list({
-        payment_intent: paymentIntentId,
-      });
-      const { orderId, userId } = session.data[0].metadata;
+      try {
+        // Validate metadata
+        if (!orderId || !userId) {
+          console.error(
+            "Missing orderId or userId in session metadata:",
+            session.metadata
+          );
+          return response.status(400).send("Invalid metadata");
+        }
 
-      // Mark Payment as Paid
-      await Order.findByIdAndUpdate(orderId, { isPaid: true });
-      // Clear user cart
-      await User.findByIdAndUpdate(userId, { cartItems: {} });
+        // Mark payment as paid
+        const updatedOrder = await Order.findByIdAndUpdate(
+          orderId,
+          { isPaid: true },
+          { new: true }
+        );
+        if (!updatedOrder) {
+          console.error(`Order ${orderId} not found`);
+          return response.status(404).send("Order not found");
+        }
+
+        // Clear user cart (assuming cartItems is an array or object)
+        const updatedUser = await User.findByIdAndUpdate(
+          userId,
+          { $set: { cartItems: [] } }, // Use [] for array, {} for object
+          { new: true }
+        );
+        if (!updatedUser) {
+          console.error(`User ${userId} not found`);
+          return response.status(404).send("User not found");
+        }
+
+        console.log(
+          `Order ${orderId} marked as paid and cart cleared for user ${userId}`
+        );
+      } catch (error) {
+        console.error(
+          "Error processing checkout.session.completed:",
+          error.message
+        );
+        return response.status(500).send("Error processing webhook");
+      }
       break;
     }
     case "payment_intent.payment_failed": {
-      const paymentIntent = event.data.object;
-      const paymentIntentId = paymentIntent.id;
+      const session = event.data.object;
+      const { orderId } = session.metadata;
 
-      // Getting Session Metadata
-      const session = await stripeInstance.checkout.sessions.list({
-        payment_intent: paymentIntentId,
-      });
-      const { orderId } = session.data[0].metadata;
-      await Order.findByIdAndDelete(orderId);
+      try {
+        const deletedOrder = await Order.findByIdAndDelete(orderId);
+        if (!deletedOrder) {
+          console.error(`Order ${orderId} not found for deletion`);
+        } else {
+          console.log(`Order ${orderId} deleted due to payment failure`);
+        }
+      } catch (error) {
+        console.error("Error deleting order:", error.message);
+        return response.status(500).send("Error processing webhook");
+      }
       break;
     }
     default:
-      console.error(`Unhandled event type ${event.type}`);
-      break;
+      console.log(`Unhandled event type ${event.type}`);
   }
+
   response.json({ received: true });
 };
 
