@@ -66,7 +66,12 @@ app.post("/stripe", express.raw({ type: "application/json" }), stripeWebhooks);
 
 // Middleware configuration
 app.use(cookieParser());
-app.use(cors({ origin: ["http://localhost:5173"], credentials: true }));
+app.use(
+  cors({
+    origin: ["http://localhost:5173", "https://green-cart-xi-teal.vercel.app"],
+    credentials: true,
+  })
+);
 app.use(express.json());
 
 // Routes
